@@ -12,6 +12,7 @@
 
 const WebSocket = require('ws');
 const http = require('http');
+const https = require('https');
 
 const PORT = process.env.PORT || 8080;
 const SARVAM_API_KEY = process.env.SARVAM_API_KEY || '';
@@ -20,13 +21,70 @@ if (!SARVAM_API_KEY) {
   console.error('❌ SARVAM_API_KEY environment variable is not set!');
 }
 
-// Simple HTTP server for health checks (Render/Railway need this)
+// Simple HTTP server for health checks + file transcription relay
 const server = http.createServer((req, res) => {
+  // CORS headers — allow the GitHub Pages app to call this proxy directly
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+  if (req.method === 'OPTIONS') {
+    res.writeHead(204);
+    res.end();
+    return;
+  }
+
   if (req.url === '/health' || req.url === '/') {
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ status: 'ok', service: 'sarvam-proxy', hasKey: !!SARVAM_API_KEY }));
     return;
   }
+
+  // Relay recording-upload transcription requests to Sarvam's REST API.
+  // Browser talks to us (CORS-enabled above), we forward server-to-server
+  // to Sarvam with the auth header that browsers can't reliably attach
+  // for multipart requests across origins.
+  if (req.url === '/transcribe-file' && req.method === 'POST') {
+    if (!SARVAM_API_KEY) {
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Server missing SARVAM_API_KEY' }));
+      return;
+    }
+    const contentType = req.headers['content-type'] || 'multipart/form-data';
+    const chunks = [];
+    req.on('data', (chunk) => chunks.push(chunk));
+    req.on('end', () => {
+      const body = Buffer.concat(chunks);
+      const sarvamReq = https.request(
+        'https://api.sarvam.ai/speech-to-text',
+        {
+          method: 'POST',
+          headers: {
+            'api-subscription-key': SARVAM_API_KEY,
+            'Content-Type': contentType,
+            'Content-Length': body.length
+          }
+        },
+        (sarvamRes) => {
+          let respBody = '';
+          sarvamRes.on('data', (c) => { respBody += c; });
+          sarvamRes.on('end', () => {
+            res.writeHead(sarvamRes.statusCode, { 'Content-Type': 'application/json' });
+            res.end(respBody);
+          });
+        }
+      );
+      sarvamReq.on('error', (err) => {
+        console.error('❌ Sarvam REST relay error:', err.message);
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Proxy relay failed: ' + err.message }));
+      });
+      sarvamReq.write(body);
+      sarvamReq.end();
+    });
+    return;
+  }
+
   res.writeHead(404);
   res.end('Not found');
 });
