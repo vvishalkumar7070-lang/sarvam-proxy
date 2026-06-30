@@ -50,10 +50,26 @@ const server = http.createServer((req, res) => {
       res.end(JSON.stringify({ error: 'Server missing SARVAM_API_KEY' }));
       return;
     }
+    const MAX_UPLOAD_BYTES = 30 * 1024 * 1024; // 30MB safety cap (REST endpoint is for <30s clips anyway)
     const contentType = req.headers['content-type'] || 'multipart/form-data';
     const chunks = [];
-    req.on('data', (chunk) => chunks.push(chunk));
+    let totalSize = 0;
+    let aborted = false;
+
+    req.on('data', (chunk) => {
+      totalSize += chunk.length;
+      if (totalSize > MAX_UPLOAD_BYTES && !aborted) {
+        aborted = true;
+        res.writeHead(413, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'File too large — use the Batch API for files over 30s/30MB' }));
+        req.destroy();
+        return;
+      }
+      if (!aborted) chunks.push(chunk);
+    });
+
     req.on('end', () => {
+      if (aborted) return;
       const body = Buffer.concat(chunks);
       const sarvamReq = https.request(
         'https://api.sarvam.ai/speech-to-text',
@@ -63,7 +79,8 @@ const server = http.createServer((req, res) => {
             'api-subscription-key': SARVAM_API_KEY,
             'Content-Type': contentType,
             'Content-Length': body.length
-          }
+          },
+          timeout: 60000 // 60s — generous for a <30s audio clip plus model inference time
         },
         (sarvamRes) => {
           let respBody = '';
@@ -74,14 +91,29 @@ const server = http.createServer((req, res) => {
           });
         }
       );
+      sarvamReq.on('timeout', () => {
+        console.error('❌ Sarvam REST relay timed out');
+        sarvamReq.destroy();
+        if (!res.headersSent) {
+          res.writeHead(504, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Sarvam took too long to respond' }));
+        }
+      });
       sarvamReq.on('error', (err) => {
         console.error('❌ Sarvam REST relay error:', err.message);
-        res.writeHead(502, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Proxy relay failed: ' + err.message }));
+        if (!res.headersSent) {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Proxy relay failed: ' + err.message }));
+        }
       });
       sarvamReq.write(body);
       sarvamReq.end();
     });
+
+    req.on('error', (err) => {
+      console.error('❌ Incoming upload request error:', err.message);
+    });
+
     return;
   }
 
