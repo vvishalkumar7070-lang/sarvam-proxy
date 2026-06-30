@@ -40,8 +40,12 @@ wss.on('connection', (clientWs, req) => {
   // Parse query params from client connection (language, model etc.)
   const url = new URL(req.url, `http://${req.headers.host}`);
   const languageCode = url.searchParams.get('language_code') || 'hi-IN';
-  const model = url.searchParams.get('model') || 'saarika:v2.5';
+  // saaras:v3 is the current recommended streaming model per Sarvam docs (better accuracy
+  // than legacy saarika:v2.5). Client can still override via ?model=saarika:v2.5 if needed.
+  const model = url.searchParams.get('model') || 'saaras:v3';
   const sampleRate = url.searchParams.get('sample_rate') || '16000';
+  // mode only applies to saaras:v3 — 'transcribe' keeps output in the spoken language (Hindi)
+  const mode = url.searchParams.get('mode') || 'transcribe';
 
   if (!SARVAM_API_KEY) {
     clientWs.send(JSON.stringify({ type: 'error', message: 'Server missing SARVAM_API_KEY' }));
@@ -50,7 +54,9 @@ wss.on('connection', (clientWs, req) => {
   }
 
   // Build Sarvam WebSocket URL with query params (model, language)
-  const sarvamUrl = `wss://api.sarvam.ai/speech-to-text/ws?language-code=${languageCode}&model=${model}&sample_rate=${sampleRate}`;
+  let sarvamUrl = `wss://api.sarvam.ai/speech-to-text/ws?language-code=${languageCode}&model=${model}&sample_rate=${sampleRate}&high_vad_sensitivity=true`;
+  if (model === 'saaras:v3') sarvamUrl += `&mode=${mode}`;
+  console.log('→ Connecting to Sarvam:', sarvamUrl.replace(SARVAM_API_KEY, '***'));
 
   // Connect to Sarvam with the required auth header (only possible server-side)
   const sarvamWs = new WebSocket(sarvamUrl, {
@@ -77,6 +83,24 @@ wss.on('connection', (clientWs, req) => {
     } catch (e) {
       console.error('Error relaying to client:', e.message);
     }
+  });
+
+  // 'unexpected-response' fires when Sarvam rejects the handshake itself (403 bad auth,
+  // 400 bad params) — carries the real HTTP status + body, the most useful signal for
+  // diagnosing "invalid api key" type failures.
+  sarvamWs.on('unexpected-response', (request, response) => {
+    let body = '';
+    response.on('data', (chunk) => { body += chunk; });
+    response.on('end', () => {
+      console.error(`❌ Sarvam rejected handshake: HTTP ${response.statusCode} — ${body}`);
+      try {
+        clientWs.send(JSON.stringify({
+          type: 'error',
+          message: `Sarvam auth/connection failed (HTTP ${response.statusCode}): ${body || response.statusMessage}`
+        }));
+        clientWs.close();
+      } catch (e) {}
+    });
   });
 
   sarvamWs.on('error', (err) => {
