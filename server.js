@@ -94,8 +94,9 @@ wss.on('connection', (clientWs, req) => {
     } catch (e) {}
   });
 
-  // Relay audio data from browser client to Sarvam
+  // Relay audio data (JSON messages with base64 audio) from browser client to Sarvam
   clientWs.on('message', (data) => {
+    // data is already a JSON string like {"audio":{"data":"...","encoding":"audio/x-raw","sample_rate":16000}}
     if (sarvamReady && sarvamWs.readyState === WebSocket.OPEN) {
       sarvamWs.send(data);
     } else {
