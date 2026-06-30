@@ -114,7 +114,7 @@ wss.on('connection', (clientWs, req) => {
   // Build Sarvam WebSocket URL with query params (model, language)
   let sarvamUrl = `wss://api.sarvam.ai/speech-to-text/ws?language-code=${languageCode}&model=${model}&sample_rate=${sampleRate}&high_vad_sensitivity=true`;
   if (model === 'saaras:v3') sarvamUrl += `&mode=${mode}`;
-  console.log('→ Connecting to Sarvam:', sarvamUrl.replace(SARVAM_API_KEY, '***'));
+  console.log('→ Connecting to Sarvam:', sarvamUrl);
 
   // Connect to Sarvam with the required auth header (only possible server-side)
   const sarvamWs = new WebSocket(sarvamUrl, {
@@ -128,11 +128,22 @@ wss.on('connection', (clientWs, req) => {
     sarvamReady = true;
     console.log('✅ Connected to Sarvam AI');
     clientWs.send(JSON.stringify({ type: 'ready' }));
-    // Flush any audio that arrived before Sarvam was ready
     while (pendingAudio.length) {
       sarvamWs.send(pendingAudio.shift());
     }
   });
+
+  // Keepalive: ping both legs every 20s so neither the browser<->proxy nor
+  // proxy<->Sarvam connection gets dropped during natural pauses in speech
+  // (many proxies/load-balancers idle-timeout WebSockets after ~30-60s of silence).
+  const keepaliveInterval = setInterval(() => {
+    if (sarvamWs.readyState === WebSocket.OPEN) {
+      try { sarvamWs.ping(); } catch(e) {}
+    }
+    if (clientWs.readyState === WebSocket.OPEN) {
+      try { clientWs.ping(); } catch(e) {}
+    }
+  }, 20000);
 
   // Relay messages from Sarvam back to the browser client
   sarvamWs.on('message', (data) => {
@@ -170,6 +181,7 @@ wss.on('connection', (clientWs, req) => {
 
   sarvamWs.on('close', (code, reason) => {
     console.log(`Sarvam WS closed: ${code} ${reason}`);
+    clearInterval(keepaliveInterval);
     try {
       clientWs.send(JSON.stringify({ type: 'closed', code, reason: reason.toString() }));
       clientWs.close();
@@ -177,18 +189,24 @@ wss.on('connection', (clientWs, req) => {
   });
 
   // Relay audio data (JSON messages with base64 audio) from browser client to Sarvam
+  const MAX_PENDING_CHUNKS = 200; // ~safety cap (~a few seconds of audio at 4096-sample chunks)
   clientWs.on('message', (data) => {
-    // data is already a JSON string like {"audio":{"data":"...","encoding":"audio/x-raw","sample_rate":16000}}
+    // data is a JSON string like {"audio":{"data":"...","encoding":"audio/wav","sample_rate":"16000"}}
     if (sarvamReady && sarvamWs.readyState === WebSocket.OPEN) {
       sarvamWs.send(data);
-    } else {
-      // Buffer audio until Sarvam connection is ready
-      pendingAudio.push(data);
+    } else if (sarvamWs.readyState === WebSocket.CONNECTING) {
+      // Buffer audio until Sarvam connection is ready, but cap it so a stuck
+      // connection can't accumulate unbounded memory.
+      if (pendingAudio.length < MAX_PENDING_CHUNKS) {
+        pendingAudio.push(data);
+      }
     }
+    // If sarvamWs is CLOSING/CLOSED, silently drop — nothing useful to do with it.
   });
 
   clientWs.on('close', () => {
     console.log('Browser client disconnected');
+    clearInterval(keepaliveInterval);
     if (sarvamWs.readyState === WebSocket.OPEN || sarvamWs.readyState === WebSocket.CONNECTING) {
       sarvamWs.close();
     }
