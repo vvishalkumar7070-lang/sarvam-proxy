@@ -112,7 +112,7 @@ wss.on('connection', (clientWs, req) => {
   }
 
   // Build Sarvam WebSocket URL with query params (model, language)
-  let sarvamUrl = `wss://api.sarvam.ai/speech-to-text/ws?language-code=${languageCode}&model=${model}&sample_rate=${sampleRate}&high_vad_sensitivity=true`;
+  let sarvamUrl = `wss://api.sarvam.ai/speech-to-text/ws?language-code=${languageCode}&model=${model}&sample_rate=${sampleRate}&high_vad_sensitivity=true&vad_signals=true`;
   if (model === 'saaras:v3') sarvamUrl += `&mode=${mode}`;
   console.log('→ Connecting to Sarvam:', sarvamUrl);
 
